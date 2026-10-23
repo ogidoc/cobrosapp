@@ -1,0 +1,1444 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Cobros - Gestión de Préstamos</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { background-color: #f6f5f2; color: #111; -webkit-font-smoothing: antialiased; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+  ::-webkit-scrollbar { display: none; }
+  .card { background-color: #fff; border: 1px solid #e8e6e1; border-radius: 16px; }
+</style>
+
+<link rel="manifest" href="./manifest.json">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="./icon-192.png">
+<script>
+// IDB helper para sync con SW
+window.CobrosIDB = {
+  dbName:'cobros_db', store:'prestamos',
+  open(){return new Promise((res,rej)=>{const r=indexedDB.open(this.dbName,1); r.onupgradeneeded=e=>{const db=e.target.result; if(!db.objectStoreNames.contains(this.store)) db.createObjectStore(this.store);}; r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error);});},
+  async save(data){try{const db=await this.open(); const tx=db.transaction(this.store,'readwrite'); tx.objectStore(this.store).put(data,'data'); return new Promise(r=>{tx.oncomplete=()=>r();});}catch(e){}},
+  async get(){try{const db=await this.open(); const tx=db.transaction(this.store,'readonly'); const req=tx.objectStore(this.store).get('data'); return new Promise(r=>{req.onsuccess=()=>r(req.result||[]); req.onerror=()=>r([]);});}catch(e){return [];}}
+};
+window.syncToSW = async function(){
+  try{
+    const raw = localStorage.getItem('cobros_prestamos');
+    if(raw){ 
+      const arr=JSON.parse(raw); 
+      await CobrosIDB.save(arr);
+      // Guardar también en CobrosDB para compatibilidad vieja
+      try{
+        const req = indexedDB.open('CobrosDB', 1);
+        req.onupgradeneeded = function(e){ try{ e.target.result.createObjectStore('datos'); }catch(x){} };
+        req.onsuccess = function(e){
+          try{ const db=e.target.result; const tx=db.transaction('datos','readwrite'); tx.objectStore('datos').put(arr,'prestamos'); }catch(x){}
+        };
+      }catch(x){}
+    }
+  }catch(e){}
+};
+
+// Notificaciones - VERSIÓN SIMPLE QUE FUNCIONA
+window.CobrosNotif = {
+  async pedirPermiso(){
+    if(!('Notification' in window)){ alert('Este navegador no soporta notificaciones'); return false; }
+    let perm = Notification.permission;
+    if(perm==='granted') return true;
+    if(perm==='denied'){ alert('Permiso bloqueado. Ve a Ajustes > Apps > Chrome > Notificaciones > Permitir'); return false; }
+    perm = await Notification.requestPermission();
+    return perm==='granted';
+  },
+  async probar(){
+    console.log('Probar notificación - inicio');
+    const ok = await this.pedirPermiso();
+    if(!ok) return;
+    // Intento 1: Notification directa (siempre funciona si hay permiso)
+    try{
+      const prestamos = JSON.parse(localStorage.getItem('cobros_prestamos')||'[]');
+      const n = new Notification('Cobros - ¡Funciona! 🔔',{
+        body:'Notificaciones activas. Tienes '+prestamos.length+' préstamos guardados. Si ves esto, el sistema funciona.',
+        icon:'./icon-192.png',
+        badge:'./icon-192.png',
+        tag:'prueba-directa',
+        requireInteraction:true
+      });
+      n.onclick = function(){ window.focus(); n.close(); };
+      console.log('Notificación directa mostrada');
+      // Cerrar después de 5s
+      setTimeout(()=>{ try{n.close();}catch(e){} }, 5000);
+    }catch(e){
+      console.error('Error notificación directa:', e);
+      alert('Error notificación directa: '+e.message+'\nProbando con Service Worker...');
+    }
+    // Intento 2: via SW (para fondo) - con timeout para no quedarse colgado
+    try{
+      const reg = await Promise.race([
+        navigator.serviceWorker.ready,
+        new Promise((_,rej)=>setTimeout(()=>rej(new Error('SW timeout')), 2000))
+      ]);
+      if(reg){
+        await reg.showNotification('Prueba Fondo (SW) 🔔',{
+          body:'Esta es la notificación que verás aunque cierres la app.',
+          icon:'./icon-192.png',
+          badge:'./icon-192.png',
+          tag:'prueba-sw',
+          vibrate:[200,100,200],
+          data:{url:'./index.html#cobros'}
+        });
+        console.log('Notificación via SW mostrada');
+      }
+    }catch(e){
+      console.log('SW no disponible para prueba (normal si no está instalado):', e.message);
+    }
+  },
+  async programarDiarias(){
+    const horaInput = document.getElementById('hora-notif-react');
+    const hora = horaInput ? horaInput.value : (localStorage.getItem('cobros_notif_hora')||'08:00');
+    localStorage.setItem('cobros_notif_hora', hora);
+    const ok = await this.pedirPermiso();
+    if(!ok) return false;
+    localStorage.setItem('cobros_notif_activas','1');
+    // Intentar registrar periodic sync pero no bloquear si falla
+    try{
+      const reg = await Promise.race([
+        navigator.serviceWorker.ready,
+        new Promise((res)=>setTimeout(()=>res(null), 1500))
+      ]);
+      if(reg && 'periodicSync' in reg){
+        try{
+          const status = await navigator.permissions.query({name:'periodic-background-sync'});
+          if(status.state==='granted'){
+            await reg.periodicSync.register('cobros-check',{minInterval: 12*60*60*1000});
+          }
+        }catch(e){}
+      }
+    }catch(e){}
+    // Mostrar confirmación con notificación directa (no depende de SW)
+    try{
+      new Notification('Notificaciones activadas ✓',{
+        body:'Te avisaré a las '+hora+' si hay cobros. Ya puedes cerrar la app.',
+        icon:'./icon-192.png'
+      });
+    }catch(e){
+      // fallback via SW si Notification directa falla
+      try{
+        const reg = await navigator.serviceWorker.ready;
+        await reg.showNotification('Notificaciones activadas ✓',{
+          body:'Te avisaré a las '+hora+' si hay cobros pendientes.',
+          icon:'./icon-192.png',
+          tag:'activacion-ok'
+        });
+      }catch(e2){}
+    }
+    return true;
+  },
+  async verificarHoy(){
+    try{
+      const raw = localStorage.getItem('cobros_prestamos');
+      if(!raw){ alert('No hay préstamos guardados'); return 0; }
+      const prestamos = JSON.parse(raw);
+      const hoy = new Date();
+      const diaHoy = hoy.getDate();
+      const mes = hoy.getMonth();
+      const anio = hoy.getFullYear();
+      let cobros = [];
+      prestamos.forEach(function(p){
+        if(p.estado!=='activo') return;
+        if((p.diaPago||1)!==diaHoy) return;
+        const tienePago = (p.pagos||[]).some(function(pg){
+          if(pg.tipo==='incremento') return false;
+          const dt = new Date(pg.fecha);
+          return dt.getMonth()===mes && dt.getFullYear()===anio;
+        });
+        if(!tienePago) cobros.push(p);
+      });
+      if(cobros.length>0){
+        const ok = await this.pedirPermiso();
+        if(ok){
+          try{
+            new Notification(cobros.length+' cobros HOY 🔔',{
+              body: cobros.map(c=>c.cliente).slice(0,3).join(', ')+(cobros.length>3?' y '+(cobros.length-3)+' más':'')+' - Tienes cobros pendientes hoy.',
+              icon:'./icon-192.png',
+              requireInteraction:true
+            });
+          }catch(e){
+            const reg = await navigator.serviceWorker.ready;
+            await reg.showNotification(cobros.length+' cobros HOY',{
+              body: cobros.map(c=>c.cliente).slice(0,2).join(', '),
+              icon:'./icon-192.png',
+              tag:'cobros-hoy'
+            });
+          }
+        }
+        return cobros.length;
+      }else{
+        // Mostrar aviso de que no hay cobros
+        const ok = await this.pedirPermiso();
+        if(ok){
+          try{
+            new Notification('Sin cobros hoy ✓',{
+              body:'No tienes cobros pendientes para hoy ('+diaHoy+'). Todo al día.',
+              icon:'./icon-192.png'
+            });
+          }catch(e){}
+        }
+        return 0;
+      }
+    }catch(e){ console.error('verificarHoy error', e); alert('Error: '+e.message); return 0; }
+  }
+};
+
+window.addEventListener('load', async()=>{
+  console.log('Load - registrando SW');
+  if('serviceWorker' in navigator){
+    try{
+      const reg = await navigator.serviceWorker.register('./sw.js');
+      console.log('SW registrado', reg.scope);
+      // No esperar a ready para no bloquear
+      navigator.serviceWorker.ready.then(r=>console.log('SW ready')).catch(e=>console.log('SW ready error', e));
+      setTimeout(()=>{ window.syncToSW(); }, 1500);
+    }catch(e){ console.error('SW fail',e); }
+  }
+  // Interceptar setItem para sync
+  try{
+    const _setItem = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = function(k,v){ _setItem(k,v); if(k==='cobros_prestamos'){ try{ window.syncToSW(); }catch(x){} } };
+  }catch(e){}
+});
+</script>
+
+
+<style>
+/* OCULTAR BANNER NETLIFY PARA SIEMPRE */
+div[class*="netlify"], iframe[src*="netlify"], a[href*="netlify.com"] > div,
+#netlify-rum-container, [data-netlify-badge] { display:none !important; }
+</style>
+<script>
+// Mata el badge de Netlify aunque lo inyecten después
+(function killNetlify(){
+  const sel = 'div, a, iframe';
+  function remove(){
+    document.querySelectorAll(sel).forEach(el=>{
+      const t = (el.textContent||'') + (el.innerHTML||'');
+      if(t.includes('Powered by Netlify') || t.includes('netlify-badge')){
+        el.style.display='none';
+        el.remove();
+      }
+    });
+  }
+  setInterval(remove, 500);
+  new MutationObserver(remove).observe(document.body,{childList:true, subtree:true});
+})();
+</script>
+
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script>
+(function(){
+"use strict";
+var React = window.React;
+var ReactDOM = window.ReactDOM;
+var h = React.createElement;
+var useState = React.useState;
+var useEffect = React.useEffect;
+var useMemo = React.useMemo;
+var useRef = React.useRef;
+
+// ÍCONO NEGRO SÓLIDO (PNG Base64 de 1x1 pixel, escalado por el manifest)
+var ICON_PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+function En(){ return Math.random().toString(36).slice(2,9)+Date.now().toString(36); }
+function R(e){ if(!e||isNaN(e)) return "$0"; return new Intl.NumberFormat("es-CO",{style:"currency",currency:"COP",maximumFractionDigits:0}).format(Math.round(e)); }
+function Pe(){ var e=new Date; return e.getFullYear()+"-"+String(e.getMonth()+1).padStart(2,"0")+"-"+String(e.getDate()).padStart(2,"0"); }
+function Cn(e){ return new Date(e+"T12:00:00"); }
+function Ue(e){
+  if(!e) return "";
+  var n = String(e).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if(n) return n[3]+"/"+n[2]+"/"+n[1];
+  try{ var t=new Date(e); if(isNaN(t.getTime())) return e; return String(t.getDate()).padStart(2,"0")+"/"+String(t.getMonth()+1).padStart(2,"0")+"/"+t.getFullYear(); }catch(x){ return e; }
+}
+function Ra(e){ var n=new Date(e); if(isNaN(n.getTime())) return ""; return String(n.getDate()).padStart(2,"0")+"/"+String(n.getMonth()+1).padStart(2,"0"); }
+function wn(e){
+  if(!e) return 0;
+  var n = String(e).replace(/[$\s]/g,"").trim();
+  if(!n) return 0;
+  var commaDecimal = /,\d{1,2}$/.test(n);
+  var dotDecimal = /\.\d{1,2}$/.test(n) && !/\.\d{3}$/.test(n);
+  if(commaDecimal){ n = n.replace(/\./g,"").replace(",","."); }
+  else if(dotDecimal){ n = n.replace(/,/g,""); }
+  else { n = n.replace(/[.,]/g,""); }
+  var t = parseFloat(n);
+  return isNaN(t) ? 0 : Math.round(t);
+}
+function Ma(e,n){ var t=new Date(e).getTime(),r=new Date(n).getTime(); if(isNaN(t)||isNaN(r)) return 0; return Math.max(0,Math.floor((r-t)/86400000)); }
+function proximoPagoNoRealizado(prestamo){
+  if(!prestamo) return Pe();
+  var hoy = new Date();
+  var y = hoy.getFullYear();
+  var m = hoy.getMonth();
+  var d = prestamo.diaPago || 5;
+  // buscar desde fechaInicio hasta 12 meses adelante el primer mes sin pago
+  var inicio = new Date(prestamo.fechaInicio);
+  var yi = inicio.getFullYear();
+  var mi = inicio.getMonth();
+  var pagosPorMes = {};
+  (prestamo.pagos||[]).forEach(function(p){
+    var dt = new Date(p.fecha);
+    var key = dt.getFullYear()+'-'+dt.getMonth();
+    pagosPorMes[key]=true;
+  });
+  // empezar desde el mes del inicio, pero el siguiente pago es el mas antiguo sin pagar que ya venció o este mes
+  // Para fecha por defecto: el mes más antiguo sin pago desde inicio hasta hoy+1, o si todos pagados, el próximo diaPago
+  var cursorY = yi;
+  var cursorM = mi;
+  // avanzar hasta encontrar hueco
+  for(var i=0;i<24;i++){
+    var lastDay = new Date(cursorY, cursorM+1, 0).getDate();
+    var diaReal = Math.min(d, lastDay);
+    var expected = new Date(cursorY, cursorM, diaReal);
+    var startOnlyDate = new Date(inicio.getFullYear(), inicio.getMonth(), inicio.getDate());
+    var expOnlyDate = new Date(expected.getFullYear(), expected.getMonth(), expected.getDate());
+    if(expOnlyDate > startOnlyDate){
+      var key = cursorY+'-'+cursorM;
+      if(!pagosPorMes[key]){
+        // si es pasado o hoy, devolver ese
+        // si es futuro pero es el primer hueco futuro, también
+        var yyyy = cursorY;
+        var mm = String(cursorM+1).padStart(2,'0');
+        var dd = String(diaReal).padStart(2,'0');
+        // si el hueco es en el pasado, devolver hoy? No, devolver la fecha del hueco para que quede registro real
+        return yyyy+'-'+mm+'-'+dd;
+      }
+    }
+    cursorM++; if(cursorM>11){cursorM=0; cursorY++;}
+  }
+  // si todos pagados, siguiente mes
+  var nextY = y, nextM = m;
+  if(hoy.getDate() > d){ nextM++; if(nextM>11){nextM=0; nextY++;} }
+  var lastDayNext = new Date(nextY, nextM+1, 0).getDate();
+  var diaNext = Math.min(d, lastDayNext);
+  return nextY+'-'+String(nextM+1).padStart(2,'0')+'-'+String(diaNext).padStart(2,'0');
+}
+function interesMesCompleto(saldo, tasa){ return Math.round(saldo * (tasa/100)); }
+
+
+function calcularDiasInteres(d) {
+  if (d <= 0) return 0;
+  var meses = Math.round(d / 30);
+  if (meses > 0 && Math.abs(d - (meses * 30)) <= 2) {
+    return meses * 30;
+  }
+  return d;
+}
+
+function kn(e){
+  var n = e.pagos.slice().sort(function(u,i){ return new Date(u.fecha).getTime()-new Date(i.fecha).getTime(); });
+  // Calcular montoInicial real si hay incrementos antes del inicio? No, montoInicial es base.
+  // Para saldo, partimos de montoInicial y vamos aplicando incrementos y abonos
+  var t = e.montoInicial;
+  var r = e.fechaInicio;
+  var l = [];
+  var pendienteAcumulado = 0;
+  for(var idx=0; idx<n.length; idx++){
+    var u = n[idx];
+    var tipo = u.tipo || "abono"; // compatibilidad con datos viejos
+    var i = Ma(r, u.fecha);
+    var iCalculo = calcularDiasInteres(i);
+    var a = t * (e.tasa/100/30) * iCalculo + pendienteAcumulado;
+    var g = u.abono;
+    var A, y, S, E;
+    if(tipo === "incremento"){
+      // Incremento: no paga interés, solo aumenta saldo
+      A = 0;
+      y = 0;
+      S = t + g;
+      E = a; // todo el interés causado queda pendiente
+      pendienteAcumulado = E;
+      l.push({
+        id: u.id, fecha: u.fecha, abono: g,
+        interesCausado: a, interesPagado: A, abonoCapital: y,
+        interesPendiente: E, saldoResultante: S, 
+        diasTranscurridos: i, 
+        diasCalculo: iCalculo,
+        saldoAnterior: t, tasaEnMomento: e.tasa,
+        tipo: "incremento"
+      });
+    } else {
+      // Abono normal
+      if(g >= a){ A=a; y=g-a; S=Math.max(0,t-y); E=0; pendienteAcumulado=0; }
+      else { A=g; y=0; S=t; E=a-g; pendienteAcumulado=E; }
+      l.push({
+        id: u.id, fecha: u.fecha, abono: g,
+        interesCausado: a, interesPagado: A, abonoCapital: y,
+        interesPendiente: E, saldoResultante: S, 
+        diasTranscurridos: i, 
+        diasCalculo: iCalculo,
+        saldoAnterior: t, tasaEnMomento: e.tasa,
+        tipo: "abono"
+      });
+    }
+    t = S; r = u.fecha;
+  }
+  return Object.assign({}, e, { pagos: l, saldo: t, estado: t <= 0 ? "pagado" : "activo" });
+}
+function Ha(){
+  var hoy = new Date();
+  function haceMeses(m){
+    var d = new Date(hoy.getFullYear(), hoy.getMonth() - m, 5, 12, 0, 0);
+    return d.toISOString();
+  }
+  var hoyISO = hoy.toISOString();
+  var n = {
+    id: "seed1", cliente: "Carlos Mendoza", montoInicial: 20000000, saldo: 20000000,
+    tasa: 5, diaPago: 5, fechaInicio: haceMeses(2),
+    notas: "Préstamo personal", estado: "activo", pagos: [], creado: hoyISO
+  };
+  var t = {
+    id: "seed2", cliente: "Laura Gómez", montoInicial: 2000000, saldo: 2000000,
+    tasa: 4, diaPago: 15, fechaInicio: haceMeses(1),
+    estado: "activo", pagos: [], creado: hoyISO
+  };
+  return [kn(n), kn(t)];
+}
+
+function App(){
+  var tabState = useState("prestamos"); var tab = tabState[0]; var setTab = tabState[1];
+  var prestamosState = useState(function(){
+    try {
+      var saved = localStorage.getItem("cobros_prestamos");
+      if(saved){
+        var arr = JSON.parse(saved);
+        if(Array.isArray(arr) && arr.length > 0){
+          return arr.map(function(p){ try { return kn(p); } catch(x){ return p; } });
+        }
+      }
+    } catch(x){}
+    return Ha();
+  });
+  var prestamos = prestamosState[0]; var setPrestamos = prestamosState[1];
+
+  var busquedaState = useState(""); var busqueda = busquedaState[0]; var setBusqueda = busquedaState[1];
+  var filtroState = useState("todos"); var filtro = filtroState[0]; var setFiltro = filtroState[1];
+  var ordenState = useState("proximoPago"); var orden = ordenState[0]; var setOrden = ordenState[1];
+  var detalleIdState = useState(null); var detalleId = detalleIdState[0]; var setDetalleId = detalleIdState[1];
+  var cobrosTabState = useState("hoy"); var cobrosTab = cobrosTabState[0]; var setCobrosTab = cobrosTabState[1];
+  
+  var nuevoFormState = useState({cliente:"", monto:"", tasa:"5", fecha:Pe(), notas:""});
+  var nuevoForm = nuevoFormState[0]; var setNuevoForm = nuevoFormState[1];
+  var pagoFormState = useState({abono:"", fecha:Pe()});
+  var pagoForm = pagoFormState[0]; var setPagoForm = pagoFormState[1];
+  var incrementoFormState = useState({monto:"", fecha:Pe()});
+  var incrementoForm = incrementoFormState[0]; var setIncrementoForm = incrementoFormState[1];
+  var tipoMovimientoState = useState("abono"); var tipoMovimiento = tipoMovimientoState[0]; var setTipoMovimiento = tipoMovimientoState[1];
+  var editandoState = useState(false); var editando = editandoState[0]; var setEditando = editandoState[1];
+  var editFormState = useState({cliente:"", tasa:"", monto:"", fecha:""});
+  var editForm = editFormState[0]; var setEditForm = editFormState[1];
+  var pagoAEliminarState = useState(null); var pagoAEliminar = pagoAEliminarState[0]; var setPagoAEliminar = pagoAEliminarState[1];
+  var toastState = useState(""); var toast = toastState[0]; var setToast = toastState[1];
+  var parserTextState = useState(""); var parserText = parserTextState[0]; var setParserText = parserTextState[1];
+  var parserPreviewState = useState(null); var parserPreview = parserPreviewState[0]; var setParserPreview = parserPreviewState[1];
+  var parserPrestamoIdState = useState(""); var parserPrestamoId = parserPrestamoIdState[0]; var setParserPrestamoId = parserPrestamoIdState[1];
+  var backupsManualesState = useState([]); var backupsManuales = backupsManualesState[0]; var setBackupsManuales = backupsManualesState[1];
+  var backupsAutoState = useState([]); var backupsAuto = backupsAutoState[0]; var setBackupsAuto = backupsAutoState[1];
+  var autoBackupState = useState(false); var autoBackup = autoBackupState[0]; var setAutoBackup = autoBackupState[1];
+  var proximosProgState = useState([]); var proximosProg = proximosProgState[0]; var setProximosProg = proximosProgState[1];
+  var fileRef = useRef(null);
+  var toastTimer = useRef(null);
+
+  useEffect(function(){
+    var meta = function(name, content, attr){
+      attr = attr || "name";
+      var el = document.querySelector('meta['+attr+'="'+name+'"]');
+      if(!el){ el = document.createElement("meta"); el.setAttribute(attr, name); document.head.appendChild(el); }
+      el.content = content;
+    };
+    meta("viewport","width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover");
+    meta("theme-color","#000000");
+    meta("apple-mobile-web-app-capable","yes");
+    meta("apple-mobile-web-app-status-bar-style","black-translucent");
+
+    // 1. Inyectar Manifest usando Data URI (Chrome lo acepta para instalación)
+    var manifest = {
+      name: "Cobros - Gestión de Préstamos",
+      short_name: "Cobros",
+      description: "Gestión de préstamos con desembolso como base de intereses",
+      start_url: window.location.href,
+      display: "standalone",
+      background_color: "#ffffff",
+      theme_color: "#000000",
+      icons: [
+        { src: ICON_PNG, sizes: "192x192", type: "image/png", purpose: "any maskable" },
+        { src: ICON_PNG, sizes: "512x512", type: "image/png", purpose: "any maskable" }
+      ]
+    };
+    var manifestDataUri = "data:application/manifest+json;charset=utf-8," + encodeURIComponent(JSON.stringify(manifest));
+    var manifestLink = document.querySelector('link[rel="manifest"]');
+    if(!manifestLink) { manifestLink = document.createElement('link'); manifestLink.rel = 'manifest'; document.head.appendChild(manifestLink); }
+    manifestLink.href = manifestDataUri;
+
+    // SW se registra externamente desde sw.js (ver window.load)
+    // No registrar blob SW aquí para evitar conflicto
+  }, []);
+
+  // Guardar datos en IndexedDB para el Service Worker
+  useEffect(function(){
+    if ('indexedDB' in window) {
+      var req = indexedDB.open('CobrosDB', 1);
+      req.onupgradeneeded = function(e) { e.target.result.createObjectStore('datos'); };
+      req.onsuccess = function(e) {
+        var db = e.target.result;
+        var tx = db.transaction('datos', 'readwrite');
+        tx.objectStore('datos').put(prestamos, 'prestamos');
+      };
+    }
+    try { localStorage.setItem("cobros_prestamos", JSON.stringify(prestamos)); } catch(x){}
+  }, [prestamos]);
+
+  useEffect(function(){
+    try { localStorage.setItem("cobros_proximos_pagos", JSON.stringify(proximosProg)); } catch(x){}
+  }, [proximosProg]);
+
+  useEffect(function(){
+    try {
+      var manual = JSON.parse(localStorage.getItem("cobros_manual_backups") || "[]");
+      var auto = JSON.parse(localStorage.getItem("cobros_auto_backups") || "[]");
+      var enabled = localStorage.getItem("cobros_auto_enabled");
+      var prox = JSON.parse(localStorage.getItem("cobros_proximos_pagos") || "[]");
+      setBackupsManuales(manual); setBackupsAuto(auto);
+      if(enabled) setAutoBackup(enabled === "true");
+      setProximosProg(prox);
+    } catch(x){}
+  }, []);
+
+  useEffect(function(){
+    if(!parserPrestamoId && prestamos.length > 0){
+      setParserPrestamoId(prestamos[0].id);
+    }
+  }, [prestamos, parserPrestamoId]);
+
+  useEffect(function(){
+    if(!autoBackup || prestamos.length === 0) return;
+    try {
+      var hoy = Pe();
+      var auto = JSON.parse(localStorage.getItem("cobros_auto_backups") || "[]");
+      if(!auto.some(function(b){ return b.fechaISO === hoy; })){
+        var nuevo = [{
+          id: En(), fecha: Ue(hoy), fechaISO: hoy,
+          hora: new Date().toLocaleTimeString("es-CO", {hour:"2-digit", minute:"2-digit"}),
+          timestamp: Date.now(),
+          data: { prestamos: prestamos, proximosProgramados: proximosProg, exportado: new Date().toISOString() }
+        }].concat(auto).slice(0, 30);
+        localStorage.setItem("cobros_auto_backups", JSON.stringify(nuevo));
+        setBackupsAuto(nuevo);
+      }
+    } catch(x){}
+  }, [autoBackup, prestamos.length]);
+
+  var mostrarToast = function(msg){
+    setToast(msg);
+    if(toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(function(){ setToast(""); }, 2000);
+  };
+
+  var detalle = useMemo(function(){
+    return prestamos.find(function(p){ return p.id === detalleId; }) || null;
+  }, [prestamos, detalleId]);
+
+  useEffect(function(){
+    if(detalleId){
+      var det = prestamos.find(function(p){ return p.id===detalleId; });
+      var fechaDef = det ? proximoPagoNoRealizado(det) : Pe();
+      setPagoForm({abono:"", fecha:fechaDef});
+      setIncrementoForm({monto:"", fecha:Pe()});
+      setTipoMovimiento("abono");
+    }
+  }, [detalleId]);
+
+  // --- Manejo botón atrás Android ---
+  useEffect(function(){
+    // Estado inicial: asegurar que hay un estado prestamos en el historial
+    if(!window.history.state){
+      window.history.replaceState({tab:"prestamos", detalle:null}, "", "#prestamos");
+    }
+
+    var onPopState = function(event){
+      var state = event.state;
+      // Si hay detalle abierto, el atrás debe cerrar detalle primero
+      if(detalleId){
+        setDetalleId(null);
+        if(state && state.tab) setTab(state.tab);
+        return;
+      }
+      // Si estamos en otra pestaña distinta a prestamos, volver a prestamos
+      if(state && state.tab){
+        setTab(state.tab);
+        if(state.detalle){
+          setDetalleId(state.detalle);
+        } else {
+          setDetalleId(null);
+        }
+      } else {
+        // sin estado, ir a prestamos
+        if(tab !== "prestamos"){
+          setTab("prestamos");
+        }
+      }
+      // Si estamos en prestamos y el usuario da atrás de nuevo, el navegador saldrá de la app (comportamiento nativo)
+    };
+
+    window.addEventListener("popstate", onPopState);
+    return function(){ window.removeEventListener("popstate", onPopState); };
+  }, [tab, detalleId]);
+
+  // Push history cuando cambia tab (solo si no es por popstate)
+  var lastTabRef = useRef(tab);
+  useEffect(function(){
+    if(lastTabRef.current === tab) return;
+    lastTabRef.current = tab;
+    if(detalleId) return; // no pushear tab si hay detalle abierto
+    if(tab === "prestamos"){
+      // si venimos de otra pestaña, el historial ya tiene prestamos atrás, no hace falta pushear duplicado
+      // pero si el state actual no es prestamos, pushear
+      if(!window.history.state || window.history.state.tab !== "prestamos"){
+        window.history.pushState({tab:"prestamos", detalle:null}, "", "#prestamos");
+      }
+    } else {
+      window.history.pushState({tab:tab, detalle:null}, "", "#"+tab);
+    }
+  }, [tab]);
+
+  // Push history cuando abre detalle
+  useEffect(function(){
+    if(detalleId){
+      window.history.pushState({tab:tab, detalle:detalleId}, "", "#detalle-"+detalleId);
+    }
+  }, [detalleId]);
+
+  var prestamosFiltrados = useMemo(function(){
+    var filtrados = prestamos.filter(function(p){
+      return p.cliente.toLowerCase().indexOf(busqueda.toLowerCase()) !== -1;
+    });
+    filtrados.sort(function(a,b){
+      if(orden==="nombre") return a.cliente.toLowerCase().localeCompare(b.cliente.toLowerCase());
+      if(orden==="antiguo") return (a.fechaInicio || a.creado || "").localeCompare(b.fechaInicio || b.creado || "");
+      if(orden==="proximoPago"){ var da=a.diaPago||0, db=b.diaPago||0; if(da!==db) return da-db; return a.cliente.toLowerCase().localeCompare(b.cliente.toLowerCase()); }
+      return (b.creado || "").localeCompare(a.creado || "");
+    });
+    return filtrados;
+  }, [prestamos, busqueda, orden]);
+
+  var cobros = useMemo(function(){
+    var result = [];
+    var now = new Date();
+    var anioActual = now.getFullYear();
+    var mesActual = now.getMonth();
+    var diaHoy = now.getDate();
+
+    var activos = prestamos.filter(function(p){ return p.estado === "activo"; });
+
+    activos.forEach(function(p){
+      var fechaInicio = new Date(p.fechaInicio);
+      var y = fechaInicio.getFullYear();
+      var m = fechaInicio.getMonth();
+      
+      var limitY = anioActual;
+      var limitM = mesActual + 1;
+      if (limitM > 11) { limitM = 0; limitY++; }
+
+      var pendingMonths = 0;
+      var totalInterest = 0;
+      var oldestPendingDate = null;
+
+      while (y < limitY || (y === limitY && m < limitM)) {
+        var lastDay = new Date(y, m + 1, 0).getDate();
+        var actualDiaPago = Math.min(p.diaPago, lastDay);
+        var expectedDate = new Date(y, m, actualDiaPago);
+        
+        var startD = new Date(fechaInicio.getFullYear(), fechaInicio.getMonth(), fechaInicio.getDate());
+        var expD = new Date(expectedDate.getFullYear(), expectedDate.getMonth(), expectedDate.getDate());
+        
+        if (expD > startD) {
+          var isPaid = p.pagos.some(function(pago) {
+            var d = new Date(pago.fecha);
+            return d.getMonth() === m && d.getFullYear() === y;
+          });
+          
+          if (!isPaid) {
+            pendingMonths++;
+            totalInterest += (p.saldo * p.tasa / 100);
+            if (!oldestPendingDate) {
+              oldestPendingDate = expectedDate;
+            }
+          }
+        }
+        m++;
+        if (m > 11) { m = 0; y++; }
+      }
+
+      if (pendingMonths > 0) {
+        var estado = "proximo";
+        var timeDiff = oldestPendingDate.getTime() - now.getTime();
+        var dayDiff = Math.ceil(timeDiff / (1000 * 3600 * 24));
+
+        var oldestD = new Date(oldestPendingDate.getFullYear(), oldestPendingDate.getMonth(), oldestPendingDate.getDate());
+        var todayD = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+        if (oldestD < todayD) {
+          estado = "vencido";
+        } else if (oldestD.getTime() === todayD.getTime()) {
+          estado = "hoy";
+        } else {
+          if (dayDiff <= 7) {
+            estado = "proximo";
+          } else {
+            estado = "ignore";
+          }
+        }
+
+        if (estado !== "ignore") {
+          result.push({
+            id: p.id,
+            prestamoId: p.id,
+            cliente: p.cliente,
+            saldo: p.saldo,
+            tasa: p.tasa,
+            diaPago: p.diaPago,
+            fechaEsperada: oldestPendingDate,
+            fechaEsperadaStr: String(oldestPendingDate.getDate()).padStart(2,"0") + "/" + String(oldestPendingDate.getMonth()+1).padStart(2,"0") + "/" + oldestPendingDate.getFullYear(),
+            mesesAdeudados: pendingMonths,
+            montoTotal: totalInterest,
+            estado: estado
+          });
+        }
+      }
+    });
+
+    var hoyList = result.filter(function(c){ return c.estado === "hoy"; });
+    var proximosList = result.filter(function(c){ return c.estado === "proximo"; });
+    var vencidosList = result.filter(function(c){ return c.estado === "vencido"; });
+
+    var sortFn = function(a,b) { return a.fechaEsperada.getTime() - b.fechaEsperada.getTime(); };
+    hoyList.sort(sortFn);
+    proximosList.sort(sortFn);
+    vencidosList.sort(sortFn);
+
+    return { hoy: hoyList, proximos: proximosList, vencidos: vencidosList };
+  }, [prestamos]);
+
+  var window.CobrosNotif.programarDiarias = async function(){
+    if (!("Notification" in window) || !("serviceWorker" in navigator)) {
+      alert("Este dispositivo no soporta notificaciones en segundo plano.");
+      return;
+    }
+    try {
+      var permiso = await Notification.requestPermission();
+      if (permiso !== "granted") {
+        alert("Permiso de notificaciones denegado.");
+        return;
+      }
+      
+      var reg = await navigator.serviceWorker.ready;
+      
+      if ('periodicSync' in reg) {
+        var estado = await navigator.permissions.query({ name: 'periodic-background-sync' });
+        if (estado.state === 'granted') {
+          await reg.periodicSync.register('cobros-notificacion', {
+            minInterval: 24 * 60 * 60 * 1000 // Intentar cada 24 horas
+          });
+          mostrarToast("Notificaciones de fondo activadas ✓");
+          new Notification("Notificaciones Activadas", { body: "Se enviarán avisos aunque cierres la app." });
+        } else {
+          alert("El sistema ha bloqueado la sincronización en segundo plano. Asegúrate de haber instalado la App en la pantalla de inicio.");
+        }
+      } else {
+        alert("Tu navegador no soporta notificaciones automáticas de fondo. Debes instalar la PWA en tu inicio (Añadir a pantalla principal).");
+      }
+    } catch (e) {
+      console.error(e);
+      alert("Error configurando notificaciones: " + e.message);
+    }
+  };
+
+  var totalCartera = prestamos.filter(function(p){ return p.estado === "activo"; }).reduce(function(s,p){ return s + p.saldo; }, 0);
+
+  var crearPrestamo = function(e){
+    e.preventDefault();
+    var monto = wn(nuevoForm.monto);
+    var tasa = parseFloat(nuevoForm.tasa);
+    if(!nuevoForm.cliente.trim()){ alert("Cliente requerido"); return; }
+    if(monto <= 0){ alert("Monto inválido"); return; }
+    if(isNaN(tasa) || tasa < 0){ alert("Tasa inválida"); return; }
+    var fecha = nuevoForm.fecha && nuevoForm.fecha.length === 10 ? nuevoForm.fecha : Pe();
+    var fechaISO = Cn(fecha).toISOString();
+    var diaPago = Cn(fecha).getDate();
+    var nuevo = {
+      id: En(), cliente: nuevoForm.cliente.trim(),
+      montoInicial: monto, saldo: monto, tasa: tasa, diaPago: diaPago,
+      fechaInicio: fechaISO, notas: nuevoForm.notas.trim(),
+      estado: "activo", pagos: [], creado: new Date().toISOString()
+    };
+    setPrestamos([nuevo].concat(prestamos));
+    setNuevoForm({cliente:"", monto:"", tasa:"5", fecha:Pe(), notas:""});
+    setTab("prestamos");
+  };
+
+  var previewPago = useMemo(function(){
+    if(!detalle) return null;
+    var fechaStr=pagoForm.fecha && pagoForm.fecha.length===10?pagoForm.fecha:Pe();
+    var fechaISO=Cn(fechaStr).toISOString();
+    var pagosOrd=detalle.pagos.slice().sort(function(a,b){ return new Date(a.fecha).getTime()-new Date(b.fecha).getTime(); });
+    var ultimo=pagosOrd.length>0?pagosOrd[pagosOrd.length-1].fecha:detalle.fechaInicio;
+    var diasReales=Ma(ultimo,fechaISO); var diasCalculo=calcularDiasInteres(diasReales);
+    var interesMensual=detalle.saldo*detalle.tasa/100; var interesDiario=interesMensual/30;
+    var causadoProporcional=interesDiario*diasCalculo;
+    var interesPendientePrevio=0; try{ var dc=kn(detalle); if(dc&&dc.pagos&&dc.pagos.length){ dc.pagos.forEach(function(pg){ if(pg.interesPendiente&&pg.interesPendiente>0) interesPendientePrevio+=pg.interesPendiente; }); } }catch(e){}
+    var interesTotalDebe=causadoProporcional+interesPendientePrevio;
+    return {fechaStr:fechaStr,fechaDisplay:Ue(fechaStr),lastDisplay:Ra(ultimo),lastFull:Ue(ultimo),dias:diasReales,diasCalculo:diasCalculo,interesMensual:interesMensual,interesDiario:interesDiario,causado:interesTotalDebe,causadoProporcional:causadoProporcional,interesPendientePrevio:interesPendientePrevio,interesTotalDebe:interesTotalDebe,saldo:detalle.saldo,tasa:detalle.tasa};
+  }, [detalle, pagoForm.fecha]);
+
+  var registrarPago = function(){
+    if(!detalle) return;
+    var abono = wn(pagoForm.abono);
+    if(abono <= 0){ alert("Ingresa abono válido"); return; }
+    var fecha = pagoForm.fecha && pagoForm.fecha.length === 10 ? pagoForm.fecha : Pe();
+    var fechaISO = Cn(fecha).toISOString();
+    if(new Date(fechaISO).getTime() < new Date(detalle.fechaInicio).getTime()){
+      alert("La fecha del abono no puede ser anterior al desembolso."); return;
+    }
+    if(new Date(fechaISO).getTime() > Date.now()){
+      if(!confirm("La fecha es futura. ¿Registrar de todas formas?")) return;
+    }
+    var nuevoPago = {
+      id: En(), fecha: fechaISO, abono: abono, tipo: "abono",
+      interesCausado: 0, interesPagado: 0, abonoCapital: 0,
+      interesPendiente: 0, saldoResultante: 0, diasTranscurridos: 0, diasCalculo: 0,
+      saldoAnterior: 0, tasaEnMomento: detalle.tasa
+    };
+    var actualizado = kn(Object.assign({}, detalle, { pagos: detalle.pagos.concat([nuevoPago]) }));
+    setPrestamos(prestamos.map(function(p){ return p.id === detalle.id ? actualizado : p; }));
+    setPagoForm({abono:"", fecha:Pe()});
+    mostrarToast("Abono registrado");
+  };
+
+  var registrarIncremento = function(){
+    if(!detalle) return;
+    var monto = wn(incrementoForm.monto);
+    if(monto <= 0){ alert("Ingresa monto de incremento válido"); return; }
+    var fecha = incrementoForm.fecha && incrementoForm.fecha.length === 10 ? incrementoForm.fecha : Pe();
+    var fechaISO = Cn(fecha).toISOString();
+    if(new Date(fechaISO).getTime() < new Date(detalle.fechaInicio).getTime()){
+      alert("La fecha del incremento no puede ser anterior al desembolso."); return;
+    }
+    if(new Date(fechaISO).getTime() > Date.now()){
+      if(!confirm("La fecha es futura. ¿Registrar incremento de todas formas?")) return;
+    }
+    var nuevoPago = {
+      id: En(), fecha: fechaISO, abono: monto, tipo: "incremento",
+      interesCausado: 0, interesPagado: 0, abonoCapital: 0,
+      interesPendiente: 0, saldoResultante: 0, diasTranscurridos: 0, diasCalculo: 0,
+      saldoAnterior: 0, tasaEnMomento: detalle.tasa
+    };
+    var actualizado = kn(Object.assign({}, detalle, { pagos: detalle.pagos.concat([nuevoPago]) }));
+    setPrestamos(prestamos.map(function(p){ return p.id === detalle.id ? actualizado : p; }));
+    setIncrementoForm({monto:"", fecha:Pe()});
+    mostrarToast("Incremento registrado: +"+R(monto));
+  };
+
+  var eliminarPago = function(){
+    if(!detalle || !pagoAEliminar) return;
+    if(!detalle.pagos.some(function(p){ return p.id === pagoAEliminar.id; })){
+      alert("Este pago ya fue eliminado."); setPagoAEliminar(null); return;
+    }
+    var pagosRestantes = detalle.pagos.filter(function(p){ return p.id !== pagoAEliminar.id; });
+    var actualizado = kn(Object.assign({}, detalle, { pagos: pagosRestantes }));
+    setPrestamos(prestamos.map(function(p){ return p.id === detalle.id ? actualizado : p; }));
+    setPagoAEliminar(null);
+    mostrarToast("Pago eliminado y saldos recalculados");
+  };
+
+  var eliminarPrestamo = function(id){
+    if(!confirm("¿Eliminar este préstamo? Se borrará con todos sus abonos.")) return;
+    setPrestamos(prestamos.filter(function(p){ return p.id !== id; }));
+    setDetalleId(null);
+  };
+
+  var guardarEdicion = function(){
+    if(!detalle) return;
+    var tasa = parseFloat(editForm.tasa);
+    var monto = editForm.monto ? wn(editForm.monto) : detalle.montoInicial;
+    if(!editForm.cliente.trim()){ alert("Cliente requerido"); return; }
+    if(isNaN(tasa)){ alert("Tasa inválida"); return; }
+    if(monto <= 0){ alert("Monto inválido"); return; }
+    var fechaStr = editForm.fecha && editForm.fecha.length===10 ? editForm.fecha : Ue(detalle.fechaInicio).split('/').reverse().join('-');
+    // Convertir DD/MM/YYYY a YYYY-MM-DD si viene de Ue, pero editForm.fecha ya es YYYY-MM-DD
+    var fechaISO = Cn(fechaStr).toISOString();
+    var diaPago = Cn(fechaStr).getDate();
+    var actualizado = kn(Object.assign({}, detalle, { cliente: editForm.cliente.trim(), tasa: tasa, montoInicial: monto, fechaInicio: fechaISO, diaPago: diaPago }));
+    setPrestamos(prestamos.map(function(p){ return p.id === detalle.id ? actualizado : p; }));
+    setEditando(false);
+    mostrarToast("Préstamo actualizado - desembolso y día actualizados");
+  };
+
+  var procesarParser = function(){
+    var txt = parserText.trim();
+    if(!txt){ alert("Pega líneas en el textarea"); return; }
+    var lineas = txt.split("\n").map(function(l){ return l.trim(); }).filter(function(l){ return l.length > 0; });
+    var parseadas = [];
+    
+    for(var idx=0; idx<lineas.length; idx++){
+      var l = lineas[idx];
+      
+      if (/fecha/i.test(l) && /inter[eé]s/i.test(l)) continue;
+
+      var m = l.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
+      if(!m) continue;
+      
+      var dd = parseInt(m[1],10), mm = parseInt(m[2],10), yy = parseInt(m[3],10);
+      if(yy < 100) yy += 2000;
+      if(mm < 1 || mm > 12 || dd < 1 || dd > 31) continue;
+      
+      var iso = yy + "-" + String(mm).padStart(2,"0") + "-" + String(dd).padStart(2,"0");
+      var resto = l.replace(m[0], " ");
+      
+      var nums = (resto.match(/\$?\s*\d[\d\.\,]*/g) || []).map(function(x){ return wn(x); }).filter(function(x){ return !isNaN(x); });
+      
+      if(nums.length === 0) continue;
+      
+      var abono = 0;
+      if (nums.length >= 3) {
+          abono = nums[1];
+      } else if (nums.length === 2) {
+          abono = nums[0];
+      } else if (nums.length === 1) {
+          continue;
+      }
+      
+      if(abono <= 0) continue;
+      
+      parseadas.push({
+        id: En(),
+        fechaStr: String(dd).padStart(2,"0")+"/"+String(mm).padStart(2,"0")+"/"+yy,
+        fechaISO: iso,
+        fechaISOFull: Cn(iso).toISOString(),
+        abono: abono,
+        raw: l,
+        short: String(dd).padStart(2,"0")+"/"+String(mm).padStart(2,"0")
+      });
+    }
+    
+    if(parseadas.length === 0){ alert("No se detectaron líneas de abonos válidas. Verifica que las columnas estén separadas."); return; }
+    
+    var hoy = Pe();
+    var pasados = parseadas.filter(function(x){ return x.fechaISO <= hoy; });
+    var futuros = parseadas.filter(function(x){ return x.fechaISO > hoy; });
+    setParserPreview({ pasados: pasados, futuros: futuros });
+  };
+
+  var aplicarParser = function(){
+    var idDestino = parserPrestamoId || (prestamos.length > 0 ? prestamos[0].id : "");
+    if(!idDestino){ alert("Selecciona préstamo destino"); return; }
+    if(!parserPreview){ alert("Primero procesa el texto"); return; }
+    var p = prestamos.find(function(x){ return x.id === idDestino; });
+    if(!p){ alert("Préstamo no encontrado"); return; }
+    var nuevosPagos = parserPreview.pasados.map(function(x){
+      return { id: En(), fecha: x.fechaISOFull, abono: x.abono,
+        interesCausado:0, interesPagado:0, abonoCapital:0, interesPendiente:0,
+        saldoResultante:0, diasTranscurridos:0, diasCalculo:0, saldoAnterior:0, tasaEnMomento: p.tasa };
+    });
+    var actualizado = kn(Object.assign({}, p, { pagos: p.pagos.concat(nuevosPagos) }));
+    var futurosProg = parserPreview.futuros.map(function(x){
+      return { id: En(), prestamoId: p.id, fecha: x.fechaStr, fechaISO: x.fechaISO,
+        fechaISOFull: x.fechaISOFull, abono: x.abono, raw: x.raw, cliente: p.cliente };
+    });
+    setProximosProg(proximosProg.concat(futurosProg));
+    setPrestamos(prestamos.map(function(x){ return x.id === p.id ? actualizado : x; }));
+    setParserText(""); setParserPreview(null);
+    mostrarToast("Parser: " + nuevosPagos.length + " pasados, " + futurosProg.length + " futuros");
+  };
+
+  var exportarBackup = function(){
+    var data = { prestamos: prestamos, proximosProgramados: proximosProg, exportado: new Date().toISOString() };
+    var entry = {
+      id: En(), fecha: Ue(Pe()), fechaISO: Pe(),
+      hora: new Date().toLocaleTimeString("es-CO", {hour:"2-digit", minute:"2-digit"}),
+      timestamp: Date.now(), data: data
+    };
+    try {
+      var manual = JSON.parse(localStorage.getItem("cobros_manual_backups") || "[]");
+      var nuevos = [entry].concat(manual).slice(0, 20);
+      localStorage.setItem("cobros_manual_backups", JSON.stringify(nuevos));
+      setBackupsManuales(nuevos);
+    } catch(x){}
+    var blob = new Blob([JSON.stringify(data, null, 2)], {type:"application/json"});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url; a.download = "cobros_backup_" + Pe() + ".json";
+    a.click(); URL.revokeObjectURL(url);
+  };
+
+  var importarBackup = function(file){
+    var reader = new FileReader();
+    reader.onload = function(ev){
+      try {
+        var data = JSON.parse(ev.target.result);
+        var arr = [];
+        if(Array.isArray(data)) arr = data;
+        else if(data.prestamos) arr = data.prestamos;
+        else if(data.data && data.data.prestamos) arr = data.data.prestamos;
+        else throw new Error("Formato no reconocido");
+        if(arr.length === 0) throw new Error("Backup vacío");
+        var mapped = arr.map(function(p){ try { return kn(p); } catch(x){ return p; } });
+        setPrestamos(mapped);
+        if(data.proximosProgramados) setProximosProg(data.proximosProgramados);
+        else if(data.data && data.data.proximosProgramados) setProximosProg(data.data.proximosProgramados);
+        alert("Backup restaurado: " + mapped.length + " préstamos");
+      } catch(err){ alert("Error importando: " + err.message); }
+    };
+    reader.readAsText(file);
+  };
+
+  var restaurarBackup = function(b){
+    if(!confirm("¿Restaurar backup del " + b.fecha + " " + b.hora + "? Se reemplazará todo.")) return;
+    try {
+      var d = b.data;
+      var arr = d.prestamos || (d.data && d.data.prestamos) || d;
+      if(!Array.isArray(arr)) throw new Error("Backup sin préstamos");
+      var mapped = arr.map(function(p){ try { return kn(p); } catch(x){ return p; } });
+      setPrestamos(mapped);
+      if(d.proximosProgramados) setProximosProg(d.proximosProgramados);
+      alert("Restaurado " + mapped.length + " préstamos");
+    } catch(err){ alert("Error: " + err.message); }
+  };
+
+  var eliminarBackup = function(id, tipo){
+    if(!confirm("¿Eliminar este backup?")) return;
+    if(tipo === "manual"){
+      var n = backupsManuales.filter(function(b){ return b.id !== id; });
+      setBackupsManuales(n);
+      try { localStorage.setItem("cobros_manual_backups", JSON.stringify(n)); } catch(x){}
+    } else {
+      var n2 = backupsAuto.filter(function(b){ return b.id !== id; });
+      setBackupsAuto(n2);
+      try { localStorage.setItem("cobros_auto_backups", JSON.stringify(n2)); } catch(x){}
+    }
+  };
+
+  var toggleAuto = function(){
+    var nv = !autoBackup;
+    setAutoBackup(nv);
+    try { localStorage.setItem("cobros_auto_enabled", String(nv)); } catch(x){}
+    if(nv && prestamos.length > 0){
+      var hoy = Pe();
+      if(!backupsAuto.some(function(b){ return b.fechaISO === hoy; })){
+        var nuevo = [{
+          id: En(), fecha: Ue(hoy), fechaISO: hoy,
+          hora: new Date().toLocaleTimeString("es-CO", {hour:"2-digit", minute:"2-digit"}),
+          timestamp: Date.now(),
+          data: { prestamos: prestamos, proximosProgramados: proximosProg }
+        }].concat(backupsAuto).slice(0, 30);
+        setBackupsAuto(nuevo);
+        try { localStorage.setItem("cobros_auto_backups", JSON.stringify(nuevo)); } catch(x){}
+      }
+    }
+  };
+
+  var borrarTodo = function(){
+    if(!confirm("¿BORRAR TODO? Se eliminarán préstamos, pagos programados y backups.")) return;
+    if(!confirm("Confirma de nuevo: ¿Seguro que quieres borrar toda la cartera?")) return;
+    try {
+      localStorage.removeItem("cobros_prestamos");
+      localStorage.removeItem("cobros_proximos_pagos");
+      localStorage.removeItem("cobros_manual_backups");
+      localStorage.removeItem("cobros_auto_backups");
+    } catch(x){}
+    setPrestamos(Ha());
+    setProximosProg([]);
+    setBackupsManuales([]);
+    setBackupsAuto([]);
+    setParserText(""); setParserPreview(null);
+    alert("Datos borrados, se restauraron ejemplos iniciales");
+  };
+
+  var listaCobros = cobrosTab === "hoy" ? cobros.hoy : cobrosTab === "7dias" ? cobros.proximos : cobros.vencidos;
+  var totalCobros = listaCobros.reduce(function(s,c){ return s + Math.round(c.montoTotal); }, 0);
+
+  return h("div", {className:"min-h-screen bg-[#f6f5f2] flex justify-center"},
+    h("div", {className:"w-full max-w-[480px] bg-[#f6f5f2] min-h-screen relative pb-[88px]"},
+      h("header", {className:"sticky top-0 z-20 bg-[#f6f5f2]/80 backdrop-blur-xl border-b border-[#e8e6e1]"},
+        h("div", {className:"px-5 pt-4 pb-3 flex items-center justify-between"},
+          h("div", {className:"flex items-center gap-3"},
+            h("div", {className:"w-9 h-9 rounded-full bg-black flex items-center justify-center text-white font-bold text-[14px]"},"C"),
+            h("div", null,
+              h("h1", {className:"text-[17px] font-semibold tracking-tight leading-none"},"Cobros"),
+              h("p", {className:"text-[11px] text-[#6b6a66] mt-[2px] font-medium"},
+                "Desembolso = base intereses • " + prestamos.filter(function(p){return p.estado==="activo";}).length + " activos"
+              )
+            )
+          )
+        )
+      ),
+      h("main", {className:"px-4 pt-4"},
+        tab === "prestamos" ? h("div", {className:"space-y-3"},
+          h("div", {className:"flex-1 relative"},
+            h("span", {className:"absolute left-3 top-1/2 -translate-y-1/2 text-[#6b6a66]"},"⌕"),
+            h("input", {value: busqueda, onChange: function(e){ setBusqueda(e.target.value); }, placeholder:"Buscar cliente...", className:"w-full bg-white border border-[#e8e6e1] rounded-full pl-9 pr-4 py-[11px] text-[14px] outline-none focus:border-black"})
+          ),
+          h("div", {className:"flex gap-2 overflow-auto pb-1"},
+            h("button", {onClick: function(){ setOrden("proximoPago"); }, className:"whitespace-nowrap px-3.5 py-2 rounded-full text-[11px] font-bold border "+(orden==="proximoPago"?"bg-black text-white border-black":"bg-white border-[#e8e6e1]")}, "Día pago"),
+            h("button", {onClick: function(){ setOrden("nombre"); }, className:"whitespace-nowrap px-3.5 py-2 rounded-full text-[11px] font-bold border "+(orden==="nombre"?"bg-black text-white border-black":"bg-white border-[#e8e6e1]")}, "A-Z"),
+            h("button", {onClick: function(){ setOrden("reciente"); }, className:"whitespace-nowrap px-3.5 py-2 rounded-full text-[11px] font-bold border "+(orden==="reciente"?"bg-black text-white border-black":"bg-white border-[#e8e6e1]")}, "Reciente")
+          ),
+          h("div", {className:"flex gap-2 text-[11px] font-medium text-[#6b6a66]"},
+            h("span", null, "Total cartera: ", h("b", {className:"text-black"}, R(totalCartera))),
+            h("span", null, "•"),
+            h("span", null, prestamosFiltrados.length + " préstamos")
+          ),
+          h("div", {className:"grid gap-3"},
+            prestamosFiltrados.length === 0 ? h("div", {className:"card p-8 text-center text-[14px] text-[#6b6a66]"},"Sin préstamos. Crea uno en Nuevo +") :
+            prestamosFiltrados.map(function(p){
+              return h("button", {key: p.id, onClick: function(){ setDetalleId(p.id); }, className:"card p-3.5 text-left hover:border-black/20 transition"},
+                h("div", {className:"flex justify-between items-start gap-2"},
+                  h("div", {className:"min-w-0 flex-1"},
+                    h("p", {className:"font-semibold text-[14px] leading-tight truncate"}, p.cliente),
+                    h("p", {className:"text-[11px] font-bold mt-[3px] text-black"}, "DÍA "+p.diaPago+" • "+p.tasa+"% • Int. mes "+R(interesMesCompleto(p.saldo,p.tasa))),
+                    h("p", {className:"text-[10px] text-[#6b6a66] mt-[2px]"}, "Desemb. "+Ue(p.fechaInicio)+" • "+p.pagos.length+" abonos")
+                  ),
+                  h("div", {className:"text-right flex-shrink-0"},
+                    h("p", {className:"text-[10px] text-[#6b6a66]"},"Saldo"),
+                    h("p", {className:"text-[14px] font-bold tracking-tight"}, R(p.saldo))
+                  )
+                )
+              );
+            })
+          )
+        ) : null,
+
+        tab === "cobros" ? h("div", {className:"space-y-4"},
+          h("div", {className:"flex bg-white border border-[#e8e6e1] rounded-full p-1"},
+            ["hoy","7dias","vencidos"].map(function(t){
+              return h("button", {key: t, onClick: function(){ setCobrosTab(t); }, className:"flex-1 py-2 rounded-full text-[12px] font-semibold transition " + (cobrosTab===t?"bg-black text-white":"text-[#6b6a66]")},
+                t==="hoy" ? "Hoy • " + cobros.hoy.length : t==="7dias" ? "Próx 7d • " + cobros.proximos.length : "Vencidos • " + cobros.vencidos.length
+              );
+            })
+          ),
+          h("div", {className:"card p-4"},
+            h("p", {className:"text-[12px] font-bold tracking-widest text-[#6b6a66]"}, "RESUMEN " + cobrosTab.toUpperCase()),
+            h("p", {className:"text-[26px] font-semibold mt-1 tracking-tight truncate"}, R(totalCobros)),
+            h("p", {className:"text-[12px] text-[#6b6a66]"}, "Interés total adeudado • " + new Date().toLocaleDateString("es-CO", {weekday:"long",day:"numeric",month:"long"}))
+          ),
+          h("div", {className:"grid gap-3"},
+            listaCobros.length === 0 ? h("div", {className:"card p-8 text-center text-[13px] text-[#6b6a66]"}, "Nada para " + cobrosTab + ". ¡Día tranquilo!") :
+            listaCobros.map(function(c){
+              return h("div", {key: c.id, className:"card p-4 flex justify-between items-center gap-2"},
+                h("div", {className:"flex items-center gap-3 min-w-0 flex-1"},
+                  h("div", {className:"w-10 h-10 rounded-full bg-[#f6f5f2] border border-[#e8e6e1] flex items-center justify-center font-semibold text-[14px] flex-shrink-0"}, c.cliente[0]),
+                  h("div", {className:"min-w-0"},
+                    h("p", {className:"font-semibold text-[14px] truncate"}, c.cliente),
+                    h("p", {className:"text-[11px] text-[#6b6a66] truncate"}, "Día " + c.diaPago + " • " + c.mesesAdeudados + " " + (c.mesesAdeudados === 1 ? "mes" : "meses") + " • Saldo " + R(c.saldo))
+                  )
+                ),
+                h("div", {className:"text-right flex-shrink-0"},
+                  h("p", {className:"text-[11px] text-[#6b6a66]"},"Total int."),
+                  h("p", {className:"font-semibold text-[14px]"}, R(c.montoTotal)),
+                  h("button", {onClick: function(){ setDetalleId(c.prestamoId); }, className:"mt-1 text-[11px] font-semibold underline"},"Cobrar")
+                )
+              );
+            })
+          )
+        ) : null,
+
+        tab === "nuevo" ? h("form", {onSubmit: crearPrestamo, className:"space-y-4"},
+          h("div", null,
+            h("h2", {className:"text-[20px] font-semibold tracking-tight"},"Nuevo préstamo"),
+            h("p", {className:"text-[13px] text-[#6b6a66] mt-1"},"La fecha de desembolso es la base para calcular intereses proporcionales.")
+          ),
+          h("div", {className:"card p-5 space-y-4"},
+            h("div", null,
+              h("label", {className:"text-[12px] font-semibold"},"Cliente *"),
+              h("input", {value: nuevoForm.cliente, onChange: function(e){ setNuevoForm(Object.assign({}, nuevoForm, {cliente: e.target.value})); }, placeholder:"Ej: Carlos Mendoza", className:"mt-1.5 w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-3 text-[14px] outline-none focus:border-black"})
+            ),
+            h("div", {className:"grid grid-cols-2 gap-3"},
+              h("div", null,
+                h("label", {className:"text-[12px] font-semibold"},"Monto inicial *"),
+                h("input", {value: nuevoForm.monto, onChange: function(e){ setNuevoForm(Object.assign({}, nuevoForm, {monto: e.target.value})); }, placeholder:"$ 20.000.000", className:"mt-1.5 w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-3 text-[14px] outline-none focus:border-black"})
+              ),
+              h("div", null,
+                h("label", {className:"text-[12px] font-semibold"},"Tasa mensual % *"),
+                h("input", {type:"number", step:"0.1", value: nuevoForm.tasa, onChange: function(e){ setNuevoForm(Object.assign({}, nuevoForm, {tasa: e.target.value})); }, className:"mt-1.5 w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-3 text-[14px] outline-none focus:border-black"})
+              )
+            ),
+            h("div", null,
+              h("label", {className:"text-[12px] font-semibold"},"Fecha desembolso * (base intereses)"),
+              h("input", {type:"date", value: nuevoForm.fecha, onChange: function(e){ setNuevoForm(Object.assign({}, nuevoForm, {fecha: e.target.value})); }, className:"mt-1.5 w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-3 text-[14px] outline-none focus:border-black"}),
+              h("p", {className:"text-[11px] text-[#6b6a66] mt-2"}, "Desembolso: " + Ue(nuevoForm.fecha) + " - Base intereses. Día de pago mensual será cada " + Cn(nuevoForm.fecha||Pe()).getDate() + ".")
+            ),
+            h("div", null,
+              h("label", {className:"text-[12px] font-semibold"},"Notas"),
+              h("textarea", {value: nuevoForm.notas, onChange: function(e){ setNuevoForm(Object.assign({}, nuevoForm, {notas: e.target.value})); }, rows:3, placeholder:"Garantía, referencia...", className:"mt-1.5 w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-3 text-[14px] outline-none focus:border-black resize-none"})
+            ),
+            h("button", {type:"submit", className:"w-full bg-black text-white rounded-full py-[14px] text-[14px] font-semibold"},"Crear préstamo"),
+            h("div", {className:"bg-[#f6f5f2] rounded-[10px] p-3 text-[11px] text-[#6b6a66] space-y-1"},
+              h("p", null,"• Fórmula: interés mensual = saldo × tasa% / 100"),
+              h("p", null,"• Diario = mensual / 30"),
+              h("p", null,"• Abono se divide automático: primero intereses causados, resto a capital")
+            )
+          )
+        ) : null,
+
+        tab === "ajustes" ? h("div", {className:"space-y-5"},
+          h("h2", {className:"text-[20px] font-semibold tracking-tight"},"Ajustes"),
+          
+          h("div", {className:"card p-5 space-y-3 bg-black text-white border-2 border-black"},
+            h("p", {className:"text-[12px] font-bold tracking-widest"},"🔔 NOTIFICACIONES"),
+            h("p", {className:"text-[11px] opacity-80 leading-snug"}, "Aviso automático cuando toque cobrar. Funciona incluso con app cerrada si instalas la PWA."),
+            h("div", {className:"flex gap-2"},
+              h("input", {id:"hora-notif-react", type:"time", defaultValue: (function(){ try{ return localStorage.getItem('cobros_notif_hora')||'08:00'; }catch(e){ return '08:00'; } })(), className:"bg-white text-black border-0 rounded-[10px] px-3 py-2 text-[13px] w-[110px]"}),
+              h("button", {onClick: function(){ 
+                var el=document.getElementById('hora-notif-react');
+                if(el){ localStorage.setItem('cobros_notif_hora', el.value); }
+                window.CobrosNotif.programarDiarias().then(function(ok){ if(ok){ alert('Activadas a las '+localStorage.getItem('cobros_notif_hora')); } });
+              }, className:"flex-1 bg-white text-black rounded-full py-2.5 text-[12px] font-bold"},"Activar")
+            ),
+            h("div", {className:"grid grid-cols-2 gap-2"},
+              h("button", {onClick: function(){ window.CobrosNotif.probar(); }, className:"bg-white text-black rounded-full py-2.5 text-[12px] font-bold border-0"}, "🔔 Probar"),
+              h("button", {onClick: function(){ window.CobrosNotif.verificarHoy(); }, className:"bg-white/20 text-white border border-white/30 rounded-full py-2.5 text-[12px] font-semibold"}, "Ver hoy")
+            ),
+            h("p", {className:"text-[10px] opacity-70 leading-snug"}, (function(){ try{ var perm=Notification.permission; var act=localStorage.getItem('cobros_notif_activas'); var hora=localStorage.getItem('cobros_notif_hora')||'08:00'; var count=(JSON.parse(localStorage.getItem('cobros_prestamos')||'[]')).length; return 'Permiso: '+perm+' • '+(act==='1'?'Activas '+hora:'Inactivas')+' • '+count+' préstamos'; }catch(e){ return 'Cargando...'; } })())
+          ),
+              h("p", {className:"text-[11px] text-[#6b6a66]"}, "Futuros: " + (parserPreview.futuros.length > 0 ? parserPreview.futuros.map(function(x){ return x.short + " " + R(x.abono); }).join(", ") : "—"))
+            ) : null
+          ),
+          h("div", {className:"card p-5 space-y-4"},
+            h("p", {className:"text-[12px] font-bold tracking-widest text-[#6b6a66]"},"BACKUPS MANUALES"),
+            h("div", {className:"flex gap-2"},
+              h("button", {onClick: exportarBackup, className:"flex-1 bg-black text-white rounded-full py-2.5 text-[13px] font-semibold"},"Exportar"),
+              h("button", {onClick: function(){ if(fileRef.current) fileRef.current.click(); }, className:"flex-1 bg-white border border-[#e8e6e1] rounded-full py-2.5 text-[13px] font-semibold"},"Importar"),
+              h("input", {ref: fileRef, type:"file", accept:".json", style:{display:"none"}, onChange: function(e){ var f = e.target.files && e.target.files[0]; if(f) importarBackup(f); e.target.value = ""; }})
+            ),
+            backupsManuales.length > 0 ? h("div", {className:"space-y-1.5 max-h-[200px] overflow-auto pr-1"},
+              backupsManuales.map(function(b){
+                return h("div", {key:b.id, className:"flex items-center justify-between bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-3 py-2"},
+                  h("div", null,
+                    h("p", {className:"text-[11px] font-semibold"}, b.fecha + " " + b.hora),
+                    h("p", {className:"text-[10px] text-[#6b6a66]"}, (b.data && b.data.prestamos ? b.data.prestamos.length : 0) + " préstamos")
+                  ),
+                  h("div", {className:"flex gap-1"},
+                    h("button", {onClick: function(){ restaurarBackup(b); }, className:"text-[10px] font-bold bg-white border border-[#e8e6e1] rounded-full px-2.5 py-1"},"Restaurar"),
+                    h("button", {onClick: function(){ eliminarBackup(b.id, "manual"); }, className:"text-[10px] font-bold text-red-600 border border-[#e8e6e1] bg-white rounded-full px-2 py-1"},"✕")
+                  )
+                );
+              })
+            ) : h("p", {className:"text-[11px] text-[#6b6a66]"},"Sin backups manuales aún.")
+          ),
+          h("div", {className:"card p-5 space-y-4"},
+            h("div", {className:"flex justify-between items-center"},
+              h("p", {className:"text-[12px] font-bold tracking-widest text-[#6b6a66]"},"BACKUP AUTOMÁTICO"),
+              h("button", {onClick: toggleAuto, className:"relative w-[44px] h-[24px] rounded-full transition " + (autoBackup?"bg-black":"bg-[#e8e6e1]")},
+                h("span", {className:"absolute top-[2px] w-[20px] h-[20px] bg-white rounded-full shadow transition " + (autoBackup?"left-[22px]":"left-[2px]")})
+              )
+            ),
+            h("p", {className:"text-[11px] text-[#6b6a66]"}, autoBackup ? "ON • Backup diario activo" : "OFF • Backup diario desactivado"),
+            h("button", {onClick: borrarTodo, className:"w-full bg-red-50 border border-red-200 text-red-700 rounded-full py-2.5 text-[12px] font-semibold"},"Borrar todos los datos")
+          ),
+          h("div", {className:"card p-5 space-y-3"},
+            h("p", {className:"text-[12px] font-bold tracking-widest text-[#6b6a66]"},"DATOS"),
+            h("p", {className:"text-[11px] text-[#6b6a66]"}, prestamos.length + " préstamos • Total " + R(totalCartera) + " • " + proximosProg.length + " próximos • Auto " + (autoBackup?"ON":"OFF") + " • " + backupsManuales.length + " manuales • " + backupsAuto.length + " auto")
+          )
+        ) : null
+      ),
+
+      detalle ? h("div", {className:"fixed inset-0 z-30 flex justify-center"},
+        h("div", {className:"absolute inset-0 bg-black/40 backdrop-blur-sm", onClick: function(){ setDetalleId(null); }}),
+        h("div", {className:"relative w-full max-w-[480px] bg-[#f6f5f2] h-full overflow-auto"},
+          h("div", {className:"sticky top-0 bg-[#f6f5f2]/90 backdrop-blur-xl border-b border-[#e8e6e1] px-5 py-4 flex items-center justify-between"},
+            h("button", {onClick: function(){ setDetalleId(null); }, className:"w-8 h-8 rounded-full bg-white border border-[#e8e6e1] flex items-center justify-center"},"←"),
+            h("p", {className:"font-semibold text-[15px]"},"Detalle préstamo"),
+            h("button", {onClick: function(){ eliminarPrestamo(detalle.id); }, className:"text-[12px] font-semibold text-red-600"},"Eliminar")
+          ),
+          h("div", {className:"p-5 space-y-5"},
+            h("div", {className:"card p-5"},
+              editando ? h("div", {className:"space-y-3"},
+                h("input", {value: editForm.cliente, onChange: function(e){ setEditForm(Object.assign({}, editForm, {cliente: e.target.value})); }, className:"w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-2.5 text-[15px] font-semibold", placeholder:"Cliente"}),
+                h("input", {value: editForm.monto, onChange: function(e){ setEditForm(Object.assign({}, editForm, {monto: e.target.value})); }, className:"w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-2.5 text-[14px]", placeholder:"Monto inicial"}),
+                h("input", {type:"number", step:"0.1", value: editForm.tasa, onChange: function(e){ setEditForm(Object.assign({}, editForm, {tasa: e.target.value})); }, className:"w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-2.5 text-[14px]", placeholder:"Tasa %"}),
+                h("div", null,
+                  h("label", {className:"text-[11px] font-semibold"},"Fecha desembolso"),
+                  h("input", {type:"date", value: editForm.fecha, onChange: function(e){ setEditForm(Object.assign({}, editForm, {fecha: e.target.value})); }, className:"mt-1 w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-2.5 text-[14px]"})
+                ),
+                h("div", {className:"flex gap-2"},
+                  h("button", {onClick: guardarEdicion, className:"flex-1 bg-black text-white rounded-full py-2 text-[13px] font-semibold"},"Guardar"),
+                  h("button", {onClick: function(){ setEditando(false); }, className:"flex-1 bg-white border border-[#e8e6e1] rounded-full py-2 text-[13px] font-semibold"},"Cancelar")
+                )
+              ) : h("div", null,
+                h("div", {className:"flex justify-between items-start gap-2"},
+                  h("div", {className:"min-w-0 flex-1"},
+                    h("p", {className:"text-[16px] font-semibold leading-tight truncate"}, detalle.cliente),
+                    h("p", {className:"text-[11px] font-bold mt-[3px] text-black"}, "DÍA "+detalle.diaPago+" • "+detalle.tasa+"% • Int. mes "+R(interesMesCompleto(detalle.saldo,detalle.tasa))),
+                    h("p", {className:"text-[10px] text-[#6b6a66] mt-[2px]"}, "Desemb. "+Ue(detalle.fechaInicio)+" • "+detalle.pagos.length+" abonos")
+                  ),
+                  h("button", {onClick: function(){ 
+                    var fechaISO = detalle.fechaInicio ? detalle.fechaInicio.slice(0,10) : Pe();
+                    setEditForm({cliente: detalle.cliente, tasa: String(detalle.tasa), monto: String(detalle.montoInicial), fecha: fechaISO}); 
+                    setEditando(true); 
+                  }, className:"text-[11px] font-bold border border-[#e8e6e1] rounded-full px-3 py-1.5 h-fit bg-black text-white flex-shrink-0"},"EDITAR")
+                ),
+                h("div", {className:"mt-3 flex justify-between items-end gap-2"},
+                  h("div", {className:"min-w-0"},
+                    h("p", {className:"text-[10px] text-[#6b6a66]"},"Saldo"),
+                    h("p", {className:"text-[15px] font-bold tracking-tight"}, R(detalle.saldo))
+                  ),
+                  h("div", {className:"text-right min-w-0"},
+                    h("p", {className:"text-[10px] text-[#6b6a66]"},"Inicial"),
+                    h("p", {className:"text-[13px] font-medium"}, R(detalle.montoInicial))
+                  )
+                ),
+                detalle.notas ? h("p", {className:"mt-3 text-[11px] bg-[#f6f5f2] border border-[#e8e6e1] rounded-[10px] p-2.5"}, detalle.notas) : null
+              )
+            ),
+            h("div", {className:"card p-5 space-y-4"},
+              h("div", {className:"flex bg-[#f6f5f2] border border-[#e8e6e1] rounded-full p-1"},
+                h("button", {onClick: function(){ setTipoMovimiento("abono"); }, className:"flex-1 py-2 rounded-full text-[12px] font-bold transition "+(tipoMovimiento==="abono"?"bg-black text-white":"text-[#6b6a66]")}, "Abonar"),
+                h("button", {onClick: function(){ setTipoMovimiento("incremento"); }, className:"flex-1 py-2 rounded-full text-[12px] font-bold transition "+(tipoMovimiento==="incremento"?"bg-black text-white":"text-[#6b6a66]")}, "Incrementar")
+              ),
+              tipoMovimiento==="abono" ? h("div", {className:"space-y-3"},
+                h("div", null,
+                  h("label", {className:"text-[11px] font-semibold"},"Abono total *"),
+                  h("input", {value: pagoForm.abono, onChange: function(e){ setPagoForm(Object.assign({}, pagoForm, {abono: e.target.value})); }, placeholder:"$ 500.000", className:"mt-1 w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-3 text-[15px] font-medium outline-none focus:border-black"}),
+                  h("div", {className:"flex gap-2 mt-2"},
+                    h("button", {onClick: function(){
+                      if(!detalle) return;
+                      var interes = interesMesCompleto(detalle.saldo, detalle.tasa);
+                      setPagoForm(Object.assign({}, pagoForm, {abono: String(interes)}));
+                    }, className:"flex-1 bg-[#fcfbf9] border border-[#e8e6e1] rounded-full py-2.5 text-[11px] font-semibold"},
+                      "Interés mes (" + (detalle ? R(interesMesCompleto(detalle.saldo, detalle.tasa)) : "$0") + ")"),
+                    h("button", {onClick: function(){
+                      if(!detalle) return;
+                      var hoyISO = new Date().toISOString();
+                      var pagosOrd = detalle.pagos.slice().sort(function(a,b){ return new Date(a.fecha).getTime()-new Date(b.fecha).getTime(); });
+                      var ultimo = pagosOrd.length>0 ? pagosOrd[pagosOrd.length-1].fecha : detalle.fechaInicio;
+                      var diasReales = Ma(ultimo, hoyISO);
+                      var diasCalculo = calcularDiasInteres(diasReales);
+                      var interesMensual = detalle.saldo*detalle.tasa/100;
+                      var causado = (interesMensual/30)*diasCalculo;
+                      var dc = null;
+                      try{ dc=kn(detalle); }catch(e){}
+                      var atrasado = 0;
+                      if(dc && dc.pagos){ dc.pagos.forEach(function(pg){ if(pg.interesPendiente&&pg.interesPendiente>0) atrasado+=pg.interesPendiente; }); }
+                      var total = causado + atrasado;
+                      setPagoForm({abono: String(Math.round(total)), fecha: Pe()});
+                    }, className:"flex-1 bg-black text-white rounded-full py-2.5 text-[11px] font-semibold"},
+                      "Causado hoy (" + (function(){ 
+                        if(!detalle) return "$0";
+                        try{
+                          var hoyISO = new Date().toISOString();
+                          var pagosOrd = detalle.pagos.slice().sort(function(a,b){ return new Date(a.fecha).getTime()-new Date(b.fecha).getTime(); });
+                          var ultimo = pagosOrd.length>0 ? pagosOrd[pagosOrd.length-1].fecha : detalle.fechaInicio;
+                          var dias = Ma(ultimo, hoyISO);
+                          var dcalc = calcularDiasInteres(dias);
+                          var mens = detalle.saldo*detalle.tasa/100;
+                          var caus = (mens/30)*dcalc;
+                          var atras = 0;
+                          try{ var dcc=kn(detalle); if(dcc&&dcc.pagos) dcc.pagos.forEach(function(pg){ if(pg.interesPendiente) atras+=pg.interesPendiente; }); }catch(e){}
+                          return R(Math.round(caus+atras));
+                        }catch(e){ return "$0"; }
+                      })() + ")")
+                  )
+                ),
+                h("div", null,
+                  h("label", {className:"text-[11px] font-semibold"},"Fecha del abono *"),
+                  h("input", {type:"date", value: pagoForm.fecha, onChange: function(e){ setPagoForm(Object.assign({}, pagoForm, {fecha: e.target.value})); }, className:"mt-1 w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-3 text-[14px] outline-none focus:border-black"})
+                ),
+                h("button", {onClick: registrarPago, className:"w-full bg-black text-white rounded-full py-3 text-[14px] font-semibold"},
+                  "Registrar abono • " + (pagoForm.abono ? R(wn(pagoForm.abono)) : "$0")
+                )
+              ) : h("div", {className:"space-y-3"},
+                h("div", null,
+                  h("label", {className:"text-[11px] font-semibold"},"Monto a incrementar *"),
+                  h("input", {value: incrementoForm.monto, onChange: function(e){ setIncrementoForm(Object.assign({}, incrementoForm, {monto: e.target.value})); }, placeholder:"$ 1.000.000", className:"mt-1 w-full bg-[#fcfbf9] border-2 border-black rounded-[12px] px-4 py-3 text-[15px] font-medium outline-none focus:border-black"}),
+                  h("p", {className:"text-[10px] text-[#6b6a66] mt-1"}, "Se sumará al saldo actual de "+(detalle?R(detalle.saldo):"$0")+" → "+(detalle&&incrementoForm.monto?R(detalle.saldo+wn(incrementoForm.monto)):"$0"))
+                ),
+                h("div", null,
+                  h("label", {className:"text-[11px] font-semibold"},"Fecha del incremento *"),
+                  h("input", {type:"date", value: incrementoForm.fecha, onChange: function(e){ setIncrementoForm(Object.assign({}, incrementoForm, {fecha: e.target.value})); }, className:"mt-1 w-full bg-[#fcfbf9] border border-[#e8e6e1] rounded-[12px] px-4 py-3 text-[14px] outline-none focus:border-black"})
+                ),
+                h("button", {onClick: registrarIncremento, className:"w-full bg-black text-white rounded-full py-3 text-[14px] font-semibold"},
+                  "Incrementar • " + (incrementoForm.monto ? R(wn(incrementoForm.monto)) : "$0")
+                ),
+                h("p", {className:"text-[10px] text-[#6b6a66] text-center"}, "Quedará registrado en el historial como + incremento")
+              )
+            ),
+
+                          h("div", {className:"card p-5"},
+              h("p", {className:"text-[12px] font-bold tracking-widest text-[#6b6a66]"}, "HISTORIAL • " + detalle.pagos.length),
+              h("div", {className:"mt-3 space-y-2.5 max-h-[420px] overflow-auto pr-1"},
+                detalle.pagos.length === 0 ? h("p", {className:"text-[13px] text-[#6b6a66]"}, "Sin movimientos.") :
+                detalle.pagos.slice().sort(function(a,b){ return new Date(b.fecha).getTime() - new Date(a.fecha).getTime(); }).map(function(pg){
+                  var esInc = pg.tipo === "incremento";
+                  return h("div", {key: pg.id, className:"border rounded-[12px] px-3 py-3 "+(esInc?"bg-black text-white border-black":"bg-[#fcfbf9] border-[#e8e6e1]")},
+                    h("div", {className:"flex justify-between items-start gap-2"},
+                      h("div", {className:"flex-1 min-w-0"},
+                        h("p", {className:"text-[12px] font-semibold"}, (esInc?"+ INCREMENTO ":"") + Ue(pg.fecha) + " • " + R(pg.abono)),
+                        h("p", {className:"text-[11px] mt-1 leading-snug "+(esInc?"text-white/70":"text-[#6b6a66]")},
+                          esInc ? "→ Aumenta saldo • Nuevo saldo " + R(pg.saldoResultante) + " • " + (pg.diasCalculo||0) + "d" : "→ Int. " + R(pg.interesPagado) + (pg.abonoCapital > 0 ? " + Cap. " + R(pg.abonoCapital) : "") + " • " + (pg.diasCalculo || pg.diasTranscurridos) + "d • Saldo " + R(pg.saldoResultante)
+                        )
+                      ),
+                      h("button", {onClick: function(){ setPagoAEliminar(pg); }, className:"w-8 h-8 rounded-full flex items-center justify-center text-[14px] flex-shrink-0 "+(esInc?"bg-white/20":"bg-white border border-[#e8e6e1]"), title:"Eliminar"},"🗑")
+                    )
+                  );
+                })
+              )
+            )
+
+          )
+        )
+      ) : null,
+
+      pagoAEliminar ? h("div", {className:"fixed inset-0 z-40 flex items-center justify-center p-5"},
+        h("div", {className:"absolute inset-0 bg-black/50 backdrop-blur-sm", onClick: function(){ setPagoAEliminar(null); }}),
+        h("div", {className:"relative w-full max-w-[360px] bg-white rounded-[20px] p-5 border border-[#e8e6e1] shadow-xl"},
+          h("p", {className:"text-[15px] font-semibold"},"¿Eliminar este abono?"),
+          h("p", {className:"text-[13px] text-[#6b6a66] mt-2 leading-snug"}, Ue(pagoAEliminar.fecha) + " • " + R(pagoAEliminar.abono)),
+          h("div", {className:"flex gap-2 mt-5"},
+            h("button", {onClick: function(){ setPagoAEliminar(null); }, className:"flex-1 bg-[#f6f5f2] border border-[#e8e6e1] rounded-full py-2.5 text-[13px] font-semibold"},"Cancelar"),
+            h("button", {onClick: eliminarPago, className:"flex-1 bg-red-600 text-white rounded-full py-2.5 text-[13px] font-semibold"},"Eliminar")
+          )
+        )
+      ) : null,
+
+      toast ? h("div", {className:"fixed bottom-[92px] left-1/2 -translate-x-1/2 bg-black text-white text-[11px] font-medium px-3 py-1.5 rounded-full z-30"}, toast) : null,
+
+      h("nav", {className:"fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-[480px] bg-white/90 backdrop-blur-xl border-t border-[#e8e6e1] flex justify-around py-2 z-20"},
+        [
+          {id:"prestamos", label:"Préstamos", icon:"◧"},
+          {id:"cobros", label:"Cobros", icon:"◫"},
+          {id:"nuevo", label:"Nuevo", icon:"+"},
+          {id:"ajustes", label:"Ajustes", icon:"⚙"}
+        ].map(function(t){
+          return h("button", {key:t.id, onClick: function(){ setTab(t.id); }, className:"flex flex-col items-center gap-1 px-4 py-1 rounded-full transition " + (tab===t.id?"text-black":"text-[#6b6a66]")},
+            h("span", {className:"w-7 h-7 rounded-full flex items-center justify-center text-[14px] font-bold " + (tab===t.id?"bg-black text-white":"bg-[#f1ede7]")}, t.icon),
+            h("span", {className:"text-[10px] font-semibold tracking-wide"}, t.label)
+          );
+        })
+      )
+    )
+  );
+}
+
+var rootEl = document.getElementById("root");
+ReactDOM.createRoot(rootEl).render(h(React.StrictMode, null, h(App)));
+})();
+</script>
+
+<script>// Panel de notificaciones ahora es nativo en React - inyección deshabilitada
+console.log("Inyección antigua deshabilitada");
+</script>
+
+</body>
+</html>
