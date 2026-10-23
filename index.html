@@ -732,7 +732,7 @@ function App(){
     return { hoy: hoyList, proximos: proximosList, vencidos: vencidosList };
   }, [prestamos]);
 
-  var window.CobrosNotif.programarDiarias = async function(){
+  window.CobrosNotif.programarDiarias = async function(){
     if (!("Notification" in window) || !("serviceWorker" in navigator)) {
       alert("Este dispositivo no soporta notificaciones en segundo plano.");
       return;
@@ -1212,7 +1212,7 @@ function App(){
             ),
             h("p", {className:"text-[10px] opacity-70 leading-snug"}, (function(){ try{ var perm=Notification.permission; var act=localStorage.getItem('cobros_notif_activas'); var hora=localStorage.getItem('cobros_notif_hora')||'08:00'; var count=(JSON.parse(localStorage.getItem('cobros_prestamos')||'[]')).length; return 'Permiso: '+perm+' • '+(act==='1'?'Activas '+hora:'Inactivas')+' • '+count+' préstamos'; }catch(e){ return 'Cargando...'; } })())
           ),
-              h("p", {className:"text-[11px] text-[#6b6a66]"}, "Futuros: " + (parserPreview.futuros.length > 0 ? parserPreview.futuros.map(function(x){ return x.short + " " + R(x.abono); }).join(", ") : "—"))
+              h("p", {className:"text-[11px] text-[#6b6a66]"}, "Futuros: " + (parserPreview?.futuros?.length > 0 ? parserPreview.futuros.map(function(x){ return x.short + " " + R(x.abono); }).join(", ") : "—"))
             ) : null
           ),
           h("div", {className:"card p-5 space-y-4"},
