@@ -212,29 +212,6 @@ window.addEventListener('load', async()=>{
 </script>
 
 
-<style>
-/* OCULTAR BANNER NETLIFY PARA SIEMPRE */
-div[class*="netlify"], iframe[src*="netlify"], a[href*="netlify.com"] > div,
-#netlify-rum-container, [data-netlify-badge] { display:none !important; }
-</style>
-<script>
-// Mata el badge de Netlify aunque lo inyecten después
-(function killNetlify(){
-  const sel = 'div, a, iframe';
-  function remove(){
-    document.querySelectorAll(sel).forEach(el=>{
-      const t = (el.textContent||'') + (el.innerHTML||'');
-      if(t.includes('Powered by Netlify') || t.includes('netlify-badge')){
-        el.style.display='none';
-        el.remove();
-      }
-    });
-  }
-  setInterval(remove, 500);
-  new MutationObserver(remove).observe(document.body,{childList:true, subtree:true});
-})();
-</script>
-
 </head>
 <body>
 <div id="root"></div>
