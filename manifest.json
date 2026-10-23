@@ -1,8 +1,9 @@
 {
   "name": "Cobros - Gestión de Préstamos",
   "short_name": "Cobros",
-  "description": "Gestión de préstamos con notificaciones de cobro incluso con app cerrada",
-  "start_url": "./index.html",
+  "description": "Gestión de préstamos, cobros y abonos",
+  "start_url": "./",
+  "scope": "./",
   "display": "standalone",
   "display_override": [
     "standalone",
